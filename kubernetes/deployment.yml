@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${APP_NAME}-deployment
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ${APP_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${APP_NAME}
+    spec:
+      containers:
+        - name: scribe-container
+          image: ${IMAGE_NAME}  # Placeholder for dynamic image name substitution
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "250m"
+            limits:
+              memory: "128Mi"
+              cpu: "500m"
+#          livenessProbe:
+#            httpGet:
+#              path: /healthz
+#              port: 8080
+#            initialDelaySeconds: 3
+#            periodSeconds: 3
+#          readinessProbe:
+#            httpGet:
+#              path: /readiness
+#              port: 8080
+#            initialDelaySeconds: 3
+#            periodSeconds: 3
+          env:
+            - name: ENV_VAR_NAME
+              value: "value"
+            - name: VERSION_NUMBER
+              value: "${VERSION_NUMBER}"
+            - name: APP_NAME
+              value: "${APP_NAME}"
+      imagePullSecrets:
+        - name: dockerhub-secret

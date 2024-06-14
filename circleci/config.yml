@@ -1,0 +1,201 @@
+version: 2.1
+
+executors:
+  terraform-executor:
+    docker:
+      - image: hashicorp/terraform:light  # Terraform Docker image for setup
+  docker-executor:
+    docker:
+      - image: circleci/python:3.7  # CircleCI executor image
+
+jobs:
+  build:
+    executor: docker-executor
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: 20.10.7
+      - run:
+          name: Docker Login
+          command: |
+            echo $DOCKERHUB_PASSWORD | docker login -u $DOCKERHUB_USERNAME --password-stdin
+      - run:
+          name: Build and Tag Docker Image
+          command: |
+            TAG=$(if [ -z "${CIRCLE_TAG}" ]; then echo "latest"; else echo "${CIRCLE_TAG}"; fi)
+            IMAGE_NAME="${DOCKER_USERNAME}/${CIRCLE_PROJECT_REPONAME}:${CIRCLE_BRANCH}-${CIRCLE_PR_NUMBER}-${CIRCLE_SHA1}"
+            VERSION_NUMBER="${CIRCLE_SHA1}"
+            APP_NAME="${CIRCLE_PROJECT_REPONAME}"
+            # Sanitize VERSION_NUMBER and APP_NAME for Kubernetes labels
+            VERSION_NUMBER=$(echo "${VERSION_NUMBER}" | tr -cd 'a-zA-Z0-9-._' | cut -c1-63)
+            APP_NAME=$(echo "${APP_NAME}" | tr -cd 'a-zA-Z0-9-._' | cut -c1-63)
+            echo "export IMAGE_NAME=${IMAGE_NAME}" >> $BASH_ENV
+            echo "export VERSION_NUMBER=${VERSION_NUMBER}" >> $BASH_ENV
+            echo "export APP_NAME=${APP_NAME}" >> $BASH_ENV
+            docker build -t $IMAGE_NAME .
+            docker tag $IMAGE_NAME $IMAGE_NAME-$TAG
+      - run:
+          name: Push Docker Image
+          command: |
+            source $BASH_ENV
+            docker push $IMAGE_NAME
+            docker push $IMAGE_NAME-$TAG
+
+  setup-environment:
+    executor: terraform-executor
+    steps:
+      - checkout
+      - run:
+          name: Terraform Init
+          command: |
+            cd terraform
+            terraform init
+      - run:
+          name: Terraform Apply
+          command: |
+            cd terraform
+            terraform apply -auto-approve -var="civo_token=${CIVO_API_TOKEN}" -var="docker_image=${DOCKERHUB_USERNAME}/${CIRCLE_PROJECT_REPONAME}:${CIRCLE_BRANCH}-${CIRCLE_PR_NUMBER}-${CIRCLE_SHA1}"
+      - run:
+          name: Extract Kubeconfig
+          command: |
+            mkdir -p ~/.kube
+            terraform output kubeconfig > ~/.kube/config
+      - persist_to_workspace:
+          root: /root/.kube
+          paths:
+            - config
+
+  create-dockerhub-secret:
+    executor: docker-executor
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /root/.kube
+      - run:
+          name: Create DockerHub Secret
+          command: |
+            if ! kubectl --kubeconfig /root/.kube/config get secret dockerhub-secret; then
+              kubectl --kubeconfig /root/.kube/config create secret docker-registry dockerhub-secret \
+                --docker-username=$DOCKERHUB_USERNAME \
+                --docker-password=$DOCKERHUB_PASSWORD \
+                --docker-email=$DOCKERHUB_EMAIL
+            else
+              echo "DockerHub secret already exists"
+            fi
+
+  deploy-testing:
+    executor: docker-executor
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: /root/.kube
+      - run:
+          name: Pull Docker Image
+          command: docker pull ${DOCKERHUB_USERNAME}/${CIRCLE_PROJECT_REPONAME}:${CIRCLE_BRANCH}-${CIRCLE_PR_NUMBER}-${CIRCLE_SHA1}
+      - run:
+          name: Deploy to Testing
+          command: |
+            source $BASH_ENV
+            envsubst < .k8s/deployment.yaml | kubectl --kubeconfig /root/.kube/config apply -f -
+
+  deploy-staging:
+    executor: docker-executor
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: /root/.kube
+      - run:
+          name: Pull Docker Image
+          command: docker pull ${DOCKERHUB_USERNAME}/${CIRCLE_PROJECT_REPONAME}:${CIRCLE_BRANCH}-${CIRCLE_PR_NUMBER}-${CIRCLE_SHA1}
+      - run:
+          name: Deploy to Staging
+          command: |
+            source $BASH_ENV
+            envsubst < .k8s/deployment.yaml | kubectl --kubeconfig /root/.kube/config apply -f -
+
+  deploy-production:
+    executor: docker-executor
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: /root/.kube
+      - run:
+          name: Pull Docker Image
+          command: docker pull ${DOCKERHUB_USERNAME}/${CIRCLE_PROJECT_REPONAME}:${CIRCLE_BRANCH}-${CIRCLE_PR_NUMBER}-${CIRCLE_SHA1}
+      - run:
+          name: Deploy to Production
+          command: |
+            source $BASH_ENV
+            envsubst < .k8s/deployment.yaml | kubectl --kubeconfig /root/.kube/config apply -f -
+
+workflows:
+  version: 2
+  setup-and-deploy:
+    jobs:
+      - build:
+          context: deployment  # Assuming a context named `dockerhub` with DOCKERHUB_USERNAME and DOCKERHUB_PASSWORD
+      - setup-environment:
+          requires:
+            - build
+          context: deployment  # Assuming a context named `civo` with CIVO_API_TOKEN
+          filters:
+            branches:
+              only: development
+      - create-dockerhub-secret:
+          requires:
+            - setup-environment
+          context: deployment
+          filters:
+            branches:
+              only: development
+      - deploy-testing:
+          requires:
+            - create-dockerhub-secret
+          filters:
+            branches:
+              only: development
+
+      - setup-environment:
+          requires:
+            - build
+          context: deployment  # Assuming a context named `civo` with CIVO_API_TOKEN
+          filters:
+            branches:
+              only: release
+      - create-dockerhub-secret:
+          requires:
+            - setup-environment
+          context: deployment
+          filters:
+            branches:
+              only: development
+      - deploy-staging:
+          requires:
+            - create-dockerhub-secret
+          filters:
+            branches:
+              only: release
+
+      - setup-environment:
+          requires:
+            - build
+          context: deployment  # Assuming a context named `civo` with CIVO_API_TOKEN
+          filters:
+            branches:
+              only: main
+      - create-dockerhub-secret:
+          requires:
+            - setup-environment
+          context: deployment
+          filters:
+            branches:
+              only: development
+      - deploy-production:
+          requires:
+            - create-dockerhub-secret
+          filters:
+            branches:
+              only: main
