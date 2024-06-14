@@ -13,7 +13,7 @@ spec:
         app: ${APP_NAME}
     spec:
       containers:
-        - name: scribe-container
+        - name: ${APP_NAME}-container
           image: ${IMAGE_NAME}  # Placeholder for dynamic image name substitution
           resources:
             requests:
